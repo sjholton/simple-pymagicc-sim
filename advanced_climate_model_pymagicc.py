@@ -35,11 +35,11 @@ class AdvancedClimateModel:
         self.magicc = None
         self.base_scenario = rcp45  # Use RCP4.5 as baseline scenario
         
-    def create_emission_scenarios(self, reduction_levels=[0.25, 0.50, 0.75, 1.00], 
+    def create_emission_scenarios(self, reduction_levels=[0.25, 0.50, 0.75, 1.00],
                                   trough_year=2050, start_year=2025, end_year=2300):
         """
         Create custom emission scenarios
-        
+
         Parameters:
         -----------
         reduction_levels : list
@@ -50,70 +50,121 @@ class AdvancedClimateModel:
             Starting year for scenarios
         end_year : int
             Ending year for scenarios
-            
+
         Returns:
         --------
         scenarios : dict
             Dictionary of scenario DataFrames ready for MAGICC
         """
+        import datetime as dt
         scenarios = {}
-        
+
         # Get baseline emissions from RCP scenario
         baseline_scenario = self.base_scenario.copy()
-        
+
         # RCP scenarios use different metadata structure - need to filter properly
-        # Extract CO2 emissions - filter by variable name
-        co2_data = baseline_scenario.filter(variable="Emissions|CO2")
-        
+        # Extract CO2 emissions - MAGICC uses two components: Fossil+Industrial and AFOLU
+        # Filter for World region only (global total)
+        co2_fossil = baseline_scenario.filter(variable="Emissions|CO2|MAGICC Fossil and Industrial",
+                                             region="World")
+        co2_afolu = baseline_scenario.filter(variable="Emissions|CO2|MAGICC AFOLU",
+                                            region="World")
+
         # Get the timeseries data
-        co2_timeseries = co2_data.timeseries()
-        
-        # Get 2025 baseline value from the first row (should be global total)
-        if 2025 in co2_timeseries.columns:
-            baseline_2025 = co2_timeseries[2025].iloc[0]
+        co2_fossil_ts = co2_fossil.timeseries()
+        co2_afolu_ts = co2_afolu.timeseries()
+
+        # Get 2025 baseline value - columns are datetime objects
+        dt_2025 = dt.datetime(2025, 1, 1)
+        if dt_2025 in co2_fossil_ts.columns:
+            baseline_2025_fossil = co2_fossil_ts[dt_2025].iloc[0]
+            baseline_2025_afolu = co2_afolu_ts[dt_2025].iloc[0]
         else:
             # Find nearest year
-            available_years = [col for col in co2_timeseries.columns if isinstance(col, (int, float))]
-            nearest_year = min(available_years, key=lambda x: abs(x - 2025))
-            baseline_2025 = co2_timeseries[nearest_year].iloc[0]
-        
+            dt_2020 = dt.datetime(2020, 1, 1)
+            dt_2030 = dt.datetime(2030, 1, 1)
+            # Interpolate between 2020 and 2030
+            if dt_2020 in co2_fossil_ts.columns and dt_2030 in co2_fossil_ts.columns:
+                fossil_2020 = co2_fossil_ts[dt_2020].iloc[0]
+                fossil_2030 = co2_fossil_ts[dt_2030].iloc[0]
+                baseline_2025_fossil = fossil_2020 + (fossil_2030 - fossil_2020) * 0.5
+
+                afolu_2020 = co2_afolu_ts[dt_2020].iloc[0]
+                afolu_2030 = co2_afolu_ts[dt_2030].iloc[0]
+                baseline_2025_afolu = afolu_2020 + (afolu_2030 - afolu_2020) * 0.5
+            else:
+                print("Warning: Could not find 2025 or nearby years")
+                return {}, 0
+
+        baseline_2025 = baseline_2025_fossil + baseline_2025_afolu
+
         print(f"2025 Baseline CO2 emissions: {baseline_2025:.2f} GtC/yr")
-        print(f"(approximately {baseline_2025 * 3.67:.1f} GtCO2/yr)")
+        print(f"  Fossil & Industrial: {baseline_2025_fossil:.2f} GtC/yr")
+        print(f"  AFOLU: {baseline_2025_afolu:.2f} GtC/yr")
+        print(f"(approximately {baseline_2025 * 3.67:.1f} GtCO2/yr total)")
         print()
-        
+
         # Create scenarios for each reduction level
         for level in reduction_levels:
             scenario = baseline_scenario.copy()
             target_emission = baseline_2025 * level
-            
-            # Get the CO2 emissions data for modification
-            scenario_co2 = scenario.filter(variable="Emissions|CO2")
-            scenario_timeseries = scenario_co2.timeseries()
-            
-            # Get available years as columns
-            available_years = [col for col in scenario_timeseries.columns if isinstance(col, (int, float))]
-            
-            # Modify emissions for each year
-            for year in available_years:
-                if year < start_year:
-                    # Keep original RCP values before start
-                    continue
-                elif year < trough_year:
-                    # Linear transition to target
-                    progress = (year - start_year) / (trough_year - start_year)
-                    new_emission = baseline_2025 - (baseline_2025 - target_emission) * progress
-                    scenario_timeseries.loc[:, year] = new_emission
-                else:
-                    # Maintain target level
-                    scenario_timeseries.loc[:, year] = target_emission
-            
-            # Update the scenario with modified emissions
-            scenario = scenario.filter(variable="Emissions|CO2", keep=False).append(
-                scenario_co2.__class__(scenario_timeseries)
-            )
-            
-            scenarios[level] = scenario
-            
+
+            # Get the CO2 emissions data for modification - both components
+            scenario_co2_fossil = scenario.filter(variable="Emissions|CO2|MAGICC Fossil and Industrial",
+                                                 region="World")
+            scenario_co2_afolu = scenario.filter(variable="Emissions|CO2|MAGICC AFOLU",
+                                                region="World")
+
+            # Get timeseries for both components
+            fossil_ts = scenario_co2_fossil.timeseries().copy()
+            afolu_ts = scenario_co2_afolu.timeseries().copy()
+
+            # Get available years as datetime columns
+            for col in fossil_ts.columns:
+                if isinstance(col, dt.datetime):
+                    year = col.year
+
+                    if year < start_year:
+                        # Keep original RCP values before start
+                        continue
+                    elif year <= trough_year:
+                        # Linear transition to target
+                        if year == start_year:
+                            new_emission = baseline_2025
+                        else:
+                            progress = (year - start_year) / (trough_year - start_year)
+                            new_emission = baseline_2025 - (baseline_2025 - target_emission) * progress
+
+                        # Scale both components proportionally to reach new_emission
+                        current_fossil = fossil_ts.iloc[0, fossil_ts.columns.get_loc(col)]
+                        current_afolu = afolu_ts.iloc[0, afolu_ts.columns.get_loc(col)]
+                        current_total = current_fossil + current_afolu
+
+                        if current_total > 0:
+                            scale_factor = new_emission / current_total
+                            fossil_ts.iloc[0, fossil_ts.columns.get_loc(col)] = current_fossil * scale_factor
+                            afolu_ts.iloc[0, afolu_ts.columns.get_loc(col)] = current_afolu * scale_factor
+                    else:
+                        # Maintain target level - scale proportionally
+                        current_fossil = fossil_ts.iloc[0, fossil_ts.columns.get_loc(col)]
+                        current_afolu = afolu_ts.iloc[0, afolu_ts.columns.get_loc(col)]
+                        current_total = current_fossil + current_afolu
+
+                        if current_total > 0:
+                            scale_factor = target_emission / current_total
+                            fossil_ts.iloc[0, fossil_ts.columns.get_loc(col)] = current_fossil * scale_factor
+                            afolu_ts.iloc[0, afolu_ts.columns.get_loc(col)] = current_afolu * scale_factor
+
+            # Update the scenario with the modified emissions
+            # Remove World region data for CO2 variables
+            scenario_filtered = scenario.filter(variable="Emissions|CO2*", region="World", keep=False)
+
+            # Add back the modified data
+            scenario_filtered = scenario_filtered.append(scenario_co2_fossil.__class__(fossil_ts))
+            scenario_filtered = scenario_filtered.append(scenario_co2_afolu.__class__(afolu_ts))
+
+            scenarios[level] = scenario_filtered
+
         return scenarios, baseline_2025
     
     def run_scenarios(self, scenarios):
